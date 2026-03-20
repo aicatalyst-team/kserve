@@ -47,6 +47,10 @@ LLMINFERENCESERVICE_CONFIGS = {
                         "limits": {"cpu": "2", "memory": "7Gi"},
                         "requests": {"cpu": "200m", "memory": "2Gi"},
                     },
+                    "securityContext": {
+                        "runAsNonRoot": False,
+                        "runAsUser": 0,
+                    },
                 }
             ]
         },
