@@ -160,6 +160,47 @@ func TestUnableToDeleteLocalModelNamespaceCacheWithActiveLLMIsvc(t *testing.T) {
 		lmnc.Namespace, lmnc.Name, llmIsvc.Namespace, llmIsvc.Name)))
 }
 
+func makeTestLLMInferenceServiceWithLoRAAdapterOnlyForNamespaceCache() v1alpha2.LLMInferenceService {
+	return v1alpha2.LLMInferenceService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "llm-lora-only",
+			Namespace: "default",
+			Annotations: map[string]string{
+				constants.LocalModelLoRAAnnotationKey: `{"my-adapter":{"cache":"iris","namespace":"default"}}`,
+			},
+		},
+	}
+}
+
+func makeTestLocalModelNamespaceCacheWithLoRAOnlyLLMIsvc() v1alpha1.LocalModelNamespaceCache {
+	lmnc := makeTestLocalModelNamespaceCache()
+	lmnc.Status.InferenceServices = nil
+	lmnc.Status.LLMInferenceServices = []v1alpha1.NamespacedName{
+		{
+			Namespace: "default",
+			Name:      "llm-lora-only",
+		},
+	}
+	return lmnc
+}
+
+func TestUnableToDeleteLocalModelNamespaceCacheWithActiveLLMIsvcLoRAAdapterOnly(t *testing.T) {
+	g := gomega.NewGomegaWithT(t)
+	lmnc := makeTestLocalModelNamespaceCacheWithLoRAOnlyLLMIsvc()
+	llmIsvc := makeTestLLMInferenceServiceWithLoRAAdapterOnlyForNamespaceCache()
+	s := runtime.NewScheme()
+	err := v1alpha2.AddToScheme(s)
+	if err != nil {
+		t.Errorf("unable to add scheme : %v", err)
+	}
+	fakeClient := fake.NewClientBuilder().WithObjects(&llmIsvc).WithScheme(s).Build()
+	validator := LocalModelNamespaceCacheValidator{Client: fakeClient}
+	warnings, err := validator.ValidateDelete(t.Context(), &lmnc)
+	g.Expect(warnings).NotTo(gomega.BeNil())
+	g.Expect(err).To(gomega.MatchError(fmt.Errorf("LocalModelNamespaceCache %s/%s is being used by LLMInferenceService %s/%s",
+		lmnc.Namespace, lmnc.Name, llmIsvc.Namespace, llmIsvc.Name)))
+}
+
 func TestUnableToCreateLocalModelNamespaceCacheWithMissingNodeGroup(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 	lmnc := makeTestLocalModelNamespaceCache()
@@ -247,17 +288,4 @@ func TestValidateUpdate_LocalModelNamespaceCacheDeletionBypass(t *testing.T) {
 	warnings, err := validator.ValidateUpdate(t.Context(), &oldLmnc, &newLmnc)
 	g.Expect(warnings).To(gomega.BeNil())
 	g.Expect(err).ToNot(gomega.HaveOccurred())
-}
-
-func TestValidateUpdate_LocalModelNamespaceCacheInvalidObjectType(t *testing.T) {
-	g := gomega.NewGomegaWithT(t)
-	s := runtime.NewScheme()
-	fakeClient := fake.NewClientBuilder().WithScheme(s).Build()
-	validator := LocalModelNamespaceCacheValidator{Client: fakeClient}
-	invalidObj := &v1beta1.InferenceService{}
-	oldLmnc := makeTestLocalModelNamespaceCache()
-	warnings, err := validator.ValidateUpdate(t.Context(), &oldLmnc, invalidObj)
-	g.Expect(warnings).To(gomega.BeNil())
-	g.Expect(err).To(gomega.HaveOccurred())
-	g.Expect(err.Error()).To(gomega.ContainSubstring("expected *v1alpha1.LocalModelNamespaceCache"))
 }

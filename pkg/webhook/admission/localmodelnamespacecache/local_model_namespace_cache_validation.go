@@ -20,19 +20,16 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/kserve/kserve/pkg/utils"
-
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/kserve/kserve/pkg/apis/serving/v1alpha1"
 	"github.com/kserve/kserve/pkg/apis/serving/v1alpha2"
 	"github.com/kserve/kserve/pkg/apis/serving/v1beta1"
 	"github.com/kserve/kserve/pkg/constants"
+	"github.com/kserve/kserve/pkg/localmodelcache"
 )
 
 // logger for the validation webhook.
@@ -50,15 +47,10 @@ type LocalModelNamespaceCacheValidator struct {
 }
 
 // +kubebuilder:webhook:verbs=create;update;delete,path=/validate-localmodelnamespacecaches,mutating=false,failurePolicy=fail,groups=serving.kserve.io,resources=localmodelnamespacecaches,versions=v1alpha1,name=localmodelnamespacecache.kserve-webhook-server.validator
-var _ webhook.CustomValidator = &LocalModelNamespaceCacheValidator{}
+var _ admission.Validator[*v1alpha1.LocalModelNamespaceCache] = &LocalModelNamespaceCacheValidator{}
 
 // ValidateCreate implements webhook.Validator so a webhook will be registered for the type
-func (v *LocalModelNamespaceCacheValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	localModelNamespaceCache, err := utils.Convert[*v1alpha1.LocalModelNamespaceCache](obj)
-	if err != nil {
-		localModelNamespaceCacheValidatorLogger.Error(err, "Unable to convert object to LocalModelNamespaceCache")
-		return nil, err
-	}
+func (v *LocalModelNamespaceCacheValidator) ValidateCreate(ctx context.Context, localModelNamespaceCache *v1alpha1.LocalModelNamespaceCache) (admission.Warnings, error) {
 	localModelNamespaceCacheValidatorLogger.Info("validate create", "name", localModelNamespaceCache.Name, "namespace", localModelNamespaceCache.Namespace)
 
 	if err := v.validateNodeGroups(ctx, localModelNamespaceCache); err != nil {
@@ -69,12 +61,7 @@ func (v *LocalModelNamespaceCacheValidator) ValidateCreate(ctx context.Context, 
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type
-func (v *LocalModelNamespaceCacheValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
-	localModelNamespaceCache, err := utils.Convert[*v1alpha1.LocalModelNamespaceCache](newObj)
-	if err != nil {
-		localModelNamespaceCacheValidatorLogger.Error(err, "Unable to convert object to LocalModelNamespaceCache")
-		return nil, err
-	}
+func (v *LocalModelNamespaceCacheValidator) ValidateUpdate(ctx context.Context, _, localModelNamespaceCache *v1alpha1.LocalModelNamespaceCache) (admission.Warnings, error) {
 	if localModelNamespaceCache.GetDeletionTimestamp() != nil {
 		return nil, nil
 	}
@@ -88,18 +75,19 @@ func (v *LocalModelNamespaceCacheValidator) ValidateUpdate(ctx context.Context, 
 }
 
 // ValidateDelete implements webhook.Validator so a webhook will be registered for the type
-func (v *LocalModelNamespaceCacheValidator) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	localModelNamespaceCache, err := utils.Convert[*v1alpha1.LocalModelNamespaceCache](obj)
-	if err != nil {
-		localModelNamespaceCacheValidatorLogger.Error(err, "Unable to convert object to LocalModelNamespaceCache")
-		return nil, err
-	}
+func (v *LocalModelNamespaceCacheValidator) ValidateDelete(ctx context.Context, localModelNamespaceCache *v1alpha1.LocalModelNamespaceCache) (admission.Warnings, error) {
 	localModelNamespaceCacheValidatorLogger.Info("validate delete", "name", localModelNamespaceCache.Name, "namespace", localModelNamespaceCache.Namespace)
 
-	// Check if current LocalModelNamespaceCache is being used by InferenceServices in the same namespace
+	// Delete protection relies on Status.InferenceServices / Status.LLMInferenceServices
+	// being up-to-date. A newly created consumer may not appear in status yet if the
+	// reconciler has not run, so deletion can race and succeed until the next reconcile.
+	// This gap already existed for base-model references; LoRA adapter references inherit it.
 	for _, isvcMeta := range localModelNamespaceCache.Status.InferenceServices {
 		isvc := v1beta1.InferenceService{}
 		if err := v.Get(ctx, client.ObjectKey(isvcMeta), &isvc); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
 			localModelNamespaceCacheValidatorLogger.Error(err, "Error getting InferenceService", "name", isvcMeta.Name, "namespace", isvcMeta.Namespace)
 			return nil, err
 		}
@@ -124,12 +112,13 @@ func (v *LocalModelNamespaceCacheValidator) ValidateDelete(ctx context.Context, 
 			localModelNamespaceCacheValidatorLogger.Error(err, "Error getting LLMInferenceService", "name", llmIsvcMeta.Name, "namespace", llmIsvcMeta.Namespace)
 			return nil, err
 		}
-		modelName, ok := llmIsvc.Labels[constants.LocalModelLabel]
-		if !ok {
-			continue
-		}
-		modelNamespace := llmIsvc.Labels[constants.LocalModelNamespaceLabel]
-		if modelName == localModelNamespaceCache.Name && modelNamespace == localModelNamespaceCache.Namespace {
+		if localmodelcache.LLMISVCReferencesNamespaceCache(
+			localModelNamespaceCache.Name,
+			localModelNamespaceCache.Namespace,
+			llmIsvc.Namespace,
+			llmIsvc.Labels,
+			llmIsvc.Annotations,
+		) {
 			return admission.Warnings{}, fmt.Errorf("LocalModelNamespaceCache %s/%s is being used by LLMInferenceService %s/%s",
 				localModelNamespaceCache.Namespace, localModelNamespaceCache.Name, llmIsvcMeta.Namespace, llmIsvcMeta.Name)
 		}
